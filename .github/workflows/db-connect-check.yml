@@ -1,0 +1,62 @@
+name: DB Connectivity Check
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # sua URL vinda do Supabase (use a de conexão direta
+      # OU a do Session Pooler caso a direta insista em dar erro de rede)
+      DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+    steps:
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+      - name: Try connect (force IPv4 + require SSL) and print server info
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1) Normaliza a URL e mascara nos logs
+          CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
+          echo "::add-mask::$CLEAN"
+
+          # 2) Extrai o host da URL (sem credenciais/porta)
+          HOST="$(printf '%s' "$CLEAN" \
+            | sed -E 's#^postgres(ql)?://([^@]+@)?([^:/?]+).*#\3#')"
+          echo "Host extraído: $HOST"
+
+          # 3) Resolve IPv4 e força PGHOSTADDR (evita rota IPv6)
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          if [ -n "${IPV4:-}" ]; then
+            export PGHOSTADDR="$IPV4"
+            echo "Forçando IPv4: $PGHOSTADDR para $HOST"
+          else
+            echo "AVISO: não foi possível resolver IPv4 (seguindo sem PGHOSTADDR)"
+          fi
+
+          # 4) Garante sslmode=require na URL
+          case "$CLEAN" in
+            *\?*) URI="${CLEAN}&sslmode=require" ;;
+            *)    URI="${CLEAN}?sslmode=require" ;;
+          esac
+
+          echo "psql usará sslmode=require"
+          psql --version
+
+          # 5) Testa a conexão e imprime informações úteis
+          echo "Testando conexão..."
+          psql "$URI" -v ON_ERROR_STOP=1 -Atc \
+            "select now(),
+                    inet_server_addr(),
+                    inet_server_port(),
+                    current_setting('ssl'),
+                    current_setting('sslmode', true);"
+
+          echo "OK: Conectado ao Postgres com SSL obrigatório."
