@@ -7,10 +7,12 @@ on:
   # permite rodar manualmente
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   backup:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout (shallow)
         uses: actions/checkout@v4
@@ -22,95 +24,69 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
 
+      - name: Preparar pasta
+        run: mkdir -p backups
+
       - name: Dump (IPv4 + TLS + verbose)
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p backups
-
-          # 1) Normaliza e EXPORTA a URL (sem espaços)
+          # 1) Normaliza URL eliminando espaços e exporta para subprocessos
           export CLEAN="$(printf '%s' "${DB_URL}" | tr -d '[:space:]')"
 
-          # 2) Parse robusto da URL com Python -> gera exports em .env-exports
+          # 2) Resolve host para IPv4 (evita IPv6 nos runners do GitHub)
+          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://([^@]+@)?([^:/?]+).*#\3#')"
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          if [ -n "$IPV4" ]; then
+            export PGHOSTADDR="$IPV4"
+          fi
+
+          # 3) Parse robusto da URL com Python -> gera exports em .env-exports
           python3 - <<'PY' > .env-exports
           import os, urllib.parse as u
-          s = os.environ['CLEAN'].replace('postgresql://', 'postgres://', 1)
+          s = os.environ['CLEAN'].replace('postgresql://','postgres://', 1)
           p = u.urlparse(s)
           q = u.parse_qs(p.query)
-
-          def out(k, v):
-              print(f"export {k}='{v}'")
-
-          out('PGUSER',     p.username or 'postgres')
-          out('PGPASSWORD', p.password or '')
-          out('PGHOST',     p.hostname or '')
-          out('PGPORT',     p.port or 5432)
-          out('PGDATABASE', (p.path or '/postgres').lstrip('/'))
-          # Se não vier sslmode na URL, usa "require"
-          out('PGSSLMODE',  (q.get('sslmode', ['require'])[0] or 'require'))
+          def out(k,v): print(f'export {k}={v}')
+          out('PGUSER',      p.username or 'postgres')
+          out('PGPASSWORD',  p.password or '')
+          out('PGHOST',      p.hostname)
+          out('PGPORT',      p.port or 5432)
+          out('PGDATABASE',  p.path.lstrip('/'))
+          out('PGSSLMODE',   (q.get('sslmode', ['require'])[0]))
           PY
 
-          # 3) Aplica as variáveis de conexão no ambiente atual
-          . ./.env-exports
+          # Carrega variáveis para este shell
+          source .env-exports
 
-          echo "Conectando:"
-          echo "  HOST=${PGHOST}  PORT=${PGPORT}  DB=${PGDATABASE}  SSL=${PGSSLMODE}"
-
-          # 4) Resolve IPv4 e, se existir, força libpq a usá-lo (evita IPv6)
-          IPV4="$(getent ahostsv4 "${PGHOST}" | awk 'NR==1{print $1}')"
-          if [ -n "${IPV4:-}" ]; then
-            export PGHOSTADDR="${IPV4}"
-            echo "Forçando IPv4: ${PGHOSTADDR}"
-          else
-            echo "Sem IPv4 resolvido (seguindo com o host padrão)."
-          fi
-
-          # 5) Gera o dump (formato custom) e comprime
+          # 4) Faz o dump (custom) e comprime
           TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
           F="db_${TS}.dump.gz"
+          pg_dump --format=custom --no-owner --no-acl | gzip -c > "backups/$F"
 
-          pg_dump --version
-          PGCONNECT_TIMEOUT=20 pg_dump --format=custom | gzip -c > "backups/${F}"
+          # Exporta nome do arquivo para os próximos steps
+          echo "FILENAME=$F" >> "$GITHUB_ENV"
 
-          echo "FILENAME=${F}" >> "$GITHUB_ENV"
-          echo "Dump gerado: backups/${F}"
-
-      # (Opcional) Faz upload do dump como artefato do workflow (útil para testes)
-      - name: Upload artifact (opcional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: db-dump
-          path: backups/*.dump.gz
-          retention-days: 7
-
-      # (Opcional) Enviar para repositório de backups privado
       - name: Enviar para repositório de backups
-        if: ${{ env.FILENAME != '' && secrets.BACKUP_REPO != '' && secrets.BACKUP_PAT != '' }}
         env:
-          GH_PAT:     ${{ secrets.BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+        shell: bash
         run: |
           set -euo pipefail
-          echo "Publicando ${FILENAME} em ${BACKUP_REPO}..."
+          REPO="${{ secrets.BACKUP_REPO }}"   # ex.: rdsilvalopes/bidly-backups
+          F="$FILENAME"
 
-          WORKDIR="$(mktemp -d)"
-          git -C "$WORKDIR" init
-          git -C "$WORKDIR" config user.name  "backup-bot"
-          git -C "$WORKDIR" config user.email "backup-bot@local"
+          git config --global user.email "backup-bot@local"
+          git config --global user.name  "Backup Bot"
 
-          git -C "$WORKDIR" remote add origin "https://${GH_PAT}@github.com/${BACKUP_REPO}.git"
-          git -C "$WORKDIR" fetch origin +refs/heads/main:refs/remotes/origin/main || true
-          if git -C "$WORKDIR" rev-parse --verify origin/main >/dev/null 2>&1; then
-            git -C "$WORKDIR" checkout -B main origin/main
-          else
-            git -C "$WORKDIR" checkout -B main
-          fi
+          rm -rf out
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" out
 
-          mkdir -p "$WORKDIR/db"
-          cp "backups/${FILENAME}" "$WORKDIR/db/"
-          git -C "$WORKDIR" add .
-          git -C "$WORKDIR" commit -m "backup: ${FILENAME}" || echo "Nada para commitar."
-          git -C "$WORKDIR" push origin main
+          cp "backups/$F" out/
+          cd out
+          git add "$F"
+          git commit -m "db: ${F}" || echo "Nada para commitar"
+          git push
