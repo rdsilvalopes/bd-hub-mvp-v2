@@ -2,109 +2,141 @@ name: Nightly DB Backup
 
 on:
   schedule:
-    - cron: "0 3 * * *"        # 03:00 UTC diariamente
+    - cron: "0 3 * * *"   # 03:00 UTC diário
   workflow_dispatch: {}
 
 permissions:
-  contents: read               # checkout
+  contents: read
+
+env:
+  BACKUP_REPO: ${{ secrets.BACKUP_REPO }}   # rdsilvalopes/bidly-backups
+  DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+  GIT_SHA:     ${{ github.sha }}
+  GIT_REF:     ${{ github.ref_name }}
+  RUN_ID:      ${{ github.run_id }}
 
 jobs:
   backup:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
 
-      # Instala o cliente PostgreSQL 17 (pg_dump 17)
-      - name: Install PostgreSQL 17 client
+      - name: Install PostgreSQL client (v17)
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo tee /etc/apt/keyrings/postgresql.asc >/dev/null
-          echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y postgresql-client-17
-          /usr/lib/postgresql/17/bin/pg_dump --version
 
       - name: Prepare folder
-        run: mkdir -p backups
+        id: prep
+        run: |
+          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+          mkdir -p backups
 
       - name: Dump database (force IPv4 + SSL if needed)
+        id: dump
+        shell: bash
         env:
-          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          TS: ${{ steps.prep.outputs.ts }}
         run: |
           set -euo pipefail
 
-          # normaliza a URL
           CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
 
-          # extrai o host
-          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://([^@]+@)?([^:/?]+).*#\3#')"
+          HOST="$(printf '%s' "$CLEAN" \
+            | sed -E 's#^postgres(ql)?://([^@]+@)?([^/:?]+).*$#\3#')"
 
-          # tenta resolver IPv4 e força via PGHOSTADDR (evita IPv6)
           IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
           if [ -n "${IPV4:-}" ]; then
             export PGHOSTADDR="$IPV4"
-            echo "Resolved $HOST -> $PGHOSTADDR"
+            echo "Resolved $HOST -> $IPV4"
           else
-            echo "WARNING: could not resolve IPv4 for $HOST (following default resolver)"
+            echo "WARNING: IPv4 not resolved; following PGHOSTADDR default"
           fi
 
-          # garante sslmode=require na URI
           case "$CLEAN" in
-            *\?*) URI="${CLEAN}&sslmode=require" ;;
-            *)    URI="${CLEAN}?sslmode=require" ;;
+            *sslmode=*) URI="$CLEAN" ;;
+            *)           URI="${CLEAN}?sslmode=require" ;;
           esac
+          echo "PGSSLMODE='(unset)'"
 
-          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
           F="db_${TS}.dump.gz"
-          PGDUMP="/usr/lib/postgresql/17/bin/pg_dump"
-
-          # dump custom format + gzip
-          "$PGDUMP" --dbname="$URI" --format=custom --no-owner --no-acl \
+          # usa a própria URI como --dbname (sem parse frágil)
+          pg_dump --dbname="$URI" --format=custom --no-owner --no-acl \
             | gzip -c > "backups/$F"
 
-          echo "FILENAME=$F" >> "$GITHUB_ENV"
-          echo "Dump created: backups/$F"
+          echo "file=$F" >> "$GITHUB_OUTPUT"
 
-      # (opcional) publique o arquivo como artifact do workflow
-      - name: Upload artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-db-backup
-          path: backups/${{ env.FILENAME }}
-          retention-days: 7
-
-      # (opcional) enviar o arquivo para o repositório de backups
-      - name: Push to backup repo
-        if: env.FILENAME != ''
-        env:
-          BACKUP_PAT:  ${{ secrets.BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}   # ex.: rdsilvalopes/bidly-backups
+      - name: Build manifest.json (linka banco ⇄ código)
+        id: manifest
         run: |
           set -euo pipefail
+          TS="${{ steps.prep.outputs.ts }}"
+          FILE="${{ steps.dump.outputs.file }}"
+          # pega "migração cabeça" (último arquivo dentro de db/migrations)
+          MIGRATION_HEAD="$(ls -1 db/migrations 2>/dev/null | tail -n 1 || true)"
 
-          git config --global user.name  "backup-bot"
-          git config --global user.email "actions@users.noreply.github.com"
+          cat > backups/manifest.json <<'JSON'
+          {
+            "timestamp_utc": "__TS__",
+            "app": {
+              "git_sha": "__SHA__",
+              "git_ref": "__REF__"
+            },
+            "db": {
+              "dump_file": "__FILE__",
+              "pg_dump_version": "__PGDUMP__",
+              "migration_head": "__MIG__"
+            },
+            "run": {
+              "github_run_id": "__RUN__",
+              "workflow": "Nightly DB Backup"
+            }
+          }
+          JSON
 
-          rm -rf backup-repo
-          git clone --depth 1 "https://x-access-token:${BACKUP_PAT}@github.com/${BACKUP_REPO}.git" backup-repo
+          PGDUMP_VER="$(pg_dump --version | sed 's/.* //')"
 
-          # organiza por data (YYYY/MM/DD)
-          DEST_DIR="backup-$(date -u +%Y/%m/%d)"
-          mkdir -p "backup-repo/${DEST_DIR}"
-          cp "backups/${FILENAME}" "backup-repo/${DEST_DIR}/"
+          sed -i \
+            -e "s/__TS__/${TS}/" \
+            -e "s/__SHA__/${GIT_SHA}/" \
+            -e "s/__REF__/${GIT_REF}/" \
+            -e "s/__FILE__/${FILE}/" \
+            -e "s/__PGDUMP__/${PGDUMP_VER}/" \
+            -e "s/__MIG__/${MIGRATION_HEAD}/" \
+            -e "s/__RUN__/${RUN_ID}/" \
+            backups/manifest.json
 
-          cd backup-repo
-          git add -A
+          echo "manifest=backups/manifest.json" >> "$GITHUB_OUTPUT"
 
-          if git diff --cached --quiet; then
-            echo "Nothing to commit (same file already exists)."
-          else
-            git commit -m "DB backup: ${FILENAME}"
-            git push origin HEAD
-          fi
+      - name: Upload artifact (local copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ steps.prep.outputs.ts }}
+          path: |
+            backups/${{ steps.dump.outputs.file }}
+            ${{ steps.manifest.outputs.manifest }}
+          retention-days: 7
+
+      - name: Push to backup repo (keep history)
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+        run: |
+          set -euo pipefail
+          TS="${{ steps.prep.outputs.ts }}"
+          FOLDER="daily/${TS:0:10}"                  # daily/AAAA-MM-DD
+          DEST="https://github.com/${BACKUP_REPO}.git"
+
+          git clone --depth=1 "$DEST" out
+          cd out
+          mkdir -p "$FOLDER"
+          cp -v ../backups/* "$FOLDER"/
+
+          git config user.name  "Backup Bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add "$FOLDER"
+          git commit -m "nightly: ${TS} (ref=${GIT_REF} sha=${GIT_SHA:0:8})" || echo "No changes to commit"
+          git push origin HEAD
