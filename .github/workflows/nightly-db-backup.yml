@@ -1,59 +1,125 @@
 name: Nightly DB Backup
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 3 * * *"   # 03:00 UTC diário
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   backup:
+    name: Nightly DB Backup
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (shallow)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Instalar cliente PostgreSQL
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
       - name: Preparar pasta
         run: mkdir -p backups
 
-      - name: Dump (pg_dump custom + gzip)
+      - name: Dump (IPv4 + TLS + verbose)
+        shell: bash
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           set -euo pipefail
+
+          # 1) Normaliza/máscara a URL
           CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
-          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://[^@]+@([^:/?]+).*#\2#')"
-          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
-          if [ -z "$IPV4" ]; then
-            echo "Não foi possível resolver IPv4 para $HOST" >&2
+          printf "::add-mask::%s\n" "$CLEAN"
+
+          # 2) Parse robusto da URL com Python -> gera exports em .env-exports
+          python3 - <<'PY' > .env-exports
+          import os, urllib.parse as u
+          s = os.environ['CLEAN'].replace('postgresql://', 'postgres://', 1)
+          p = u.urlparse(s)
+          q = u.parse_qs(p.query)
+          def out(k, v): print(f'export {k}={v}')
+          out('PGUSER',      p.username or 'postgres')
+          out('PGPASSWORD',  p.password or '')
+          out('PGHOST',      p.hostname)
+          out('PGPORT',      p.port or 5432)
+          out('PGDATABASE', (p.path or '/postgres').lstrip('/'))
+          out('PGSSLMODE',   (q.get('sslmode', ['require'])[0]))
+          PY
+
+          # 3) Carrega exports e mascara o password nos logs
+          set -a; source .env-exports; set +a
+          printf "::add-mask::%s\n" "$PGPASSWORD"
+
+          # 4) Força IPv4: resolve A (não AAAA) e usa em PGHOSTADDR (mantém SNI)
+          IPV4="$(getent ahostsv4 "$PGHOST" | awk 'NR==1{print $1}')"
+          if [ -z "${IPV4:-}" ]; then
+            echo "Não foi possível resolver IPv4 para $PGHOST" >&2
             exit 1
           fi
           export PGHOSTADDR="$IPV4"
-          TS="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+          echo "Usando IPv4: $PGHOSTADDR (host=$PGHOST, port=$PGPORT, db=$PGDATABASE)"
+
+          # 5) Teste de conectividade
+          echo "== psql \\conninfo =="
+          psql -v ON_ERROR_STOP=1 -Atc '\conninfo' \
+            "sslmode=$PGSSLMODE dbname=$PGDATABASE host=$PGHOST user=$PGUSER port=$PGPORT"
+
+          # 6) Dump custom + gzip (verbose)
+          TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
           F="db_${TS}.dump.gz"
-          pg_dump --dbname="$CLEAN" --format=custom | gzip -c > "backups/$F"
+          echo "== Iniciando pg_dump =="
+          pg_dump -v -Fc \
+            "postgresql://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE?sslmode=$PGSSLMODE" \
+            | gzip -c > "backups/$F"
+
           echo "FILENAME=$F" >> "$GITHUB_ENV"
+          echo "Dump OK: backups/$F"
 
       - name: Enviar para repositório de backups
         env:
-          GH_PAT: ${{ secrets.BACKUP_PAT }}
+          BACKUP_PAT:  ${{ secrets.BACKUP_PAT }}
           BACKUP_REPO: ${{ secrets.BACKUP_REPO }}   # ex.: rdsilvalopes/bidly-backups
         run: |
           set -euo pipefail
-          git config --global user.email "bot@github-actions"
-          git config --global user.name  "backup-bot"
+          test -n "$BACKUP_PAT" -a -n "$BACKUP_REPO"
 
-          TMP="$(mktemp -d)"
-          cd "$TMP"
-          git clone --depth=1 "https://${GH_PAT}@github.com/${BACKUP_REPO}.git" repo
-          cd repo
+          rm -rf out && mkdir out
+          git -C out init
+          git -C out config user.name  "github-actions[bot]"
+          git -C out config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C out remote add origin "https://${BACKUP_PAT}@github.com/${BACKUP_REPO}.git"
 
-          mkdir -p postgres
-          cp "${GITHUB_WORKSPACE}/backups/${FILENAME}" "postgres/${FILENAME}"
+          if git -C out ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+            git -C out fetch origin main
+            git -C out checkout -B main origin/main
+          elif git -C out ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
+            git -C out fetch origin master
+            git -C out checkout -B main origin/master
+          else
+            git -C out checkout -B main
+          fi
 
-          git add -A
-          git commit -m "db: nightly backup ${FILENAME}" || echo "Nada para commitar"
-          git push
+          mkdir -p out/postgres
+          cp -v "backups/${FILENAME}" "out/postgres/${FILENAME}"
+          echo "created: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "out/postgres/${FILENAME}.meta"
+
+          git -C out add -A
+          git -C out commit -m "backup: ${FILENAME}" || echo "Nada a commitar"
+          git -C out push origin main
+
+      - name: Upload artifact (opcional)
+        if: always() && env.FILENAME != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILENAME }}
+          path: backups/${{ env.FILENAME }}
+          retention-days: 3
