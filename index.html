@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>BD Hub • Login</title>
+    <link rel="stylesheet" href="./assets/css/base.css" />
+  </head>
+  <body class="wrap">
+    <h1><span class="badge">🔐</span> Bidly</h1>
+    <!-- DESKTOP / NOTEBOOK -->
+    <p class="tagline tagline--desktop">
+      Conecta empresas com Headhunters e Recrutadores. 
+      <br>Empresa define o Perfil | Hunters e Recrutadores | Candidato Ideal.</br>
+      Agilidade, Menor Custo e Transparência.
+    </p>
+
+    <!-- MOBILE (mais enxuto) -->
+    <p class="tagline tagline--mobile">
+      Conecta empresas com Headhunters e Recrutadores. 
+      <br>Empresa define o Perfil | Hunters e Recrutadores | Candidato Ideal.</br>
+      Agilidade, Menor Custo e Transparência.
+    </p>
+
+    <div class="row" style="gap: 8px; flex-wrap: wrap">
+      <!-- inputs e botões já existentes -->
+
+      <div class="card card-pad">
+        <div class="row" style="gap: 8px; flex-wrap: wrap">
+          <!-- dentro do seu card de login, com o seu CSS -->
+          <input id="email" type="email" placeholder="Seu e-mail" />
+          <input id="password" type="password" placeholder="Sua senha" />
+          <button id="btnSignIn" class="btn">Entrar</button>
+          <button id="btnSignUp" class="btn outline">Criar conta</button>
+       
+      </div>
+      <div class="row" style="justify-content: space-between; margin-top: 12px">
+        <a id="lnkForgot" href="#" class="muted">Esqueci minha senha</a>
+        <a id="lnkResend" href="#" class="muted"
+          >Reenviar e-mail de confirmação</a
+        >
+      </div>
+      <small
+        id="authMsg"
+        class="muted"
+        style="display: block; margin-top: 8px"
+      ></small>
+    </div>
+
+    <!-- scripts (ordem importa) -->
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.46.1/dist/umd/supabase.js"></script>
+    <script src="/assets/js/supa.js?v=base1"></script>
+    <script src="/assets/js/auth.js?v=base1"></script>
+
+    <script>
+      // Remove o badge do CodeSandbox caso seja injetado depois
+      const hideCSBBadge = () => {
+        document
+          .querySelectorAll(
+            '#sb__open-sandbox, .csb-portal, iframe[title="Open Sandbox"], button[aria-label="Open Sandbox"], [data-csb-overlay]'
+          )
+          .forEach((el) => el.remove());
+      };
+
+      // tenta agora e observa mudanças futuras
+      hideCSBBadge();
+      const obs = new MutationObserver(hideCSBBadge);
+      obs.observe(document.body, { childList: true, subtree: true });
+    </script>
+  </body>
+</html>
+
+
+
+
