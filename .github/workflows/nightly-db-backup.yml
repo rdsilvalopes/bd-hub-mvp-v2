@@ -2,22 +2,19 @@ name: Nightly DB Backup
 
 on:
   schedule:
-    - cron: "0 3 * * *"   # 03:00 UTC
+    - cron: "0 3 * * *"   # 03:00 UTC diário
   workflow_dispatch:
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Instalar cliente PostgreSQL
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
       - name: Preparar pasta
         run: mkdir -p backups
@@ -27,24 +24,36 @@ jobs:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           set -euo pipefail
-          echo "::add-mask::$DB_URL"
-          TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
-          FILE="db_${TS}.dump.gz"
-          pg_dump --no-owner --no-acl --format=custom "$DB_URL" | gzip -c > "backups/$FILE"
-          echo "FILENAME=$FILE" >> "$GITHUB_ENV"
+          CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
+          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://[^@]+@([^:/?]+).*#\2#')"
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          if [ -z "$IPV4" ]; then
+            echo "Não foi possível resolver IPv4 para $HOST" >&2
+            exit 1
+          fi
+          export PGHOSTADDR="$IPV4"
+          TS="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+          F="db_${TS}.dump.gz"
+          pg_dump --dbname="$CLEAN" --format=custom | gzip -c > "backups/$F"
+          echo "FILENAME=$F" >> "$GITHUB_ENV"
 
       - name: Enviar para repositório de backups
         env:
-          PAT:  ${{ secrets.BACKUP_PAT }}
-          REPO: ${{ secrets.BACKUP_REPO }}
+          GH_PAT: ${{ secrets.BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}   # ex.: rdsilvalopes/bidly-backups
         run: |
           set -euo pipefail
-          git clone "https://${PAT}@github.com/${REPO}.git" out
-          mkdir -p out/pgsql
-          cp -f "backups/${FILENAME}" out/pgsql/
-          cd out
-          git config user.name  "bidly-backup-bot"
-          git config user.email "bot@users.noreply.github.com"
+          git config --global user.email "bot@github-actions"
+          git config --global user.name  "backup-bot"
+
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          git clone --depth=1 "https://${GH_PAT}@github.com/${BACKUP_REPO}.git" repo
+          cd repo
+
+          mkdir -p postgres
+          cp "${GITHUB_WORKSPACE}/backups/${FILENAME}" "postgres/${FILENAME}"
+
           git add -A
-          git commit -m "backup: ${FILENAME}" || echo "Nada para commit"
-          git push origin main
+          git commit -m "db: nightly backup ${FILENAME}" || echo "Nada para commitar"
+          git push
