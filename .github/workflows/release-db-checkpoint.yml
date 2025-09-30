@@ -2,8 +2,8 @@ name: Release DB Checkpoint
 
 on:
   release:
-    types: [published]            # dispara quando você publica uma Release/Tag
-  workflow_dispatch:              # permite rodar manualmente para testes
+    types: [published]
+  workflow_dispatch:
     inputs:
       tag:
         description: "Tag para salvar (se rodar manualmente)"
@@ -14,14 +14,11 @@ permissions:
   contents: read
 
 env:
-  # secrets já usados no nightly
   BACKUP_REPO: ${{ secrets.BACKUP_REPO }}       # ex.: rdsilvalopes/bidly-backups
-  DB_URL:      ${{ secrets.SUPABASE_DB_URL }}   # sua URI (pooler) com senha
+  DB_URL:      ${{ secrets.SUPABASE_DB_URL }}   # URI do pooler com senha (sem colchetes)
   GH_TOKEN:    ${{ secrets.BACKUP_PAT }}        # PAT com contents:read&write no repo de backups
 
-  # tag definida conforme o gatilho
   TAG_NAME: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
-
   GIT_SHA:  ${{ github.sha }}
   GIT_REF:  ${{ github.ref_name }}
   RUN_ID:   ${{ github.run_id }}
@@ -33,12 +30,8 @@ jobs:
     steps:
       - name: Checkout (shallow)
         uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
-
-      - name: Install PostgreSQL client (v17)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y postgresql-client-17
+        with:
+          fetch-depth: 1
 
       - name: Prepare folder
         id: prep
@@ -48,7 +41,7 @@ jobs:
           echo "ts=$TS" >> "$GITHUB_OUTPUT"
           mkdir -p backups
 
-      - name: Dump DB (IPv4 + SSL)
+      - name: Dump DB with pg_dump 17 (Docker: postgres:17-alpine)
         id: dump
         shell: bash
         env:
@@ -56,29 +49,30 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 1) Normaliza URL
           CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
 
-          # Extrai host para resolver IPv4
-          HOST="$(printf '%s' "$CLEAN" \
-            | sed -E 's#^postgres(ql)?://([^@]+@)?([^/:?]+).*$#\3#')"
-
+          # 2) Extrai host e resolve IPv4 (evita IPv6)
+          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://([^@]+@)?([^/:?]+).*$#\3#')"
           IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
           if [ -n "${IPV4:-}" ]; then
-            export PGHOSTADDR="$IPV4"
+            EXTRA="-e PGHOSTADDR=$IPV4"
             echo "Resolved $HOST -> $IPV4"
           else
-            echo "WARNING: IPv4 not resolved; following PGHOSTADDR default"
+            EXTRA=""
+            echo "WARNING: IPv4 not resolved; following default resolver"
           fi
 
-          # SSL obrigatório
+          # 3) SSL obrigatório
           case "$CLEAN" in
             *sslmode=*) URI="$CLEAN" ;;
             *)           URI="${CLEAN}?sslmode=require" ;;
           esac
-          echo "PGSSLMODE='(unset)'"
 
+          # 4) Faz o dump usando pg_dump v17 dentro do container oficial
           F="db_${TS}.dump.gz"
-          pg_dump --dbname="$URI" --format=custom --no-owner --no-acl \
+          docker run --rm -i $EXTRA -e URI="$URI" postgres:17-alpine \
+            sh -lc 'pg_dump --dbname="$URI" --format=custom --no-owner --no-acl' \
             | gzip -c > "backups/$F"
 
           echo "file=$F" >> "$GITHUB_OUTPUT"
@@ -89,7 +83,7 @@ jobs:
           set -euo pipefail
           TS="${{ steps.prep.outputs.ts }}"
           FILE="${{ steps.dump.outputs.file }}"
-          PGDUMP_VER="$(pg_dump --version | sed 's/.* //')"
+          PGDUMP_VER="17.x (docker postgres:17-alpine)"
           MIGRATION_HEAD="$(ls -1 db/migrations 2>/dev/null | tail -n 1 || true)"
 
           cat > backups/manifest.json <<JSON
@@ -106,7 +100,7 @@ jobs:
             },
             "run": {
               "github_run_id": "${RUN_ID}",
-              "workflow": "Release DB Checkpoint"
+              "workflow": "Release DB Checkpoint (docker)"
             }
           }
           JSON
