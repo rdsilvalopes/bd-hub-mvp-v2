@@ -1,0 +1,101 @@
+name: Release DB Checkpoint
+
+on:
+  release:
+    types: [published]   # quando você publicar uma release/tag
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+  DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+  GH_TOKEN:    ${{ secrets.BACKUP_PAT }}
+  GIT_SHA:     ${{ github.sha }}
+  GIT_REF:     ${{ github.ref_name }}
+  RUN_ID:      ${{ github.run_id }}
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client-17
+
+      - id: prep
+        run: |
+          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+          mkdir -p backups
+
+      - id: dump
+        env: { TS: ${{ steps.prep.outputs.ts }} }
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
+          HOST="$(printf '%s' "$CLEAN" \
+            | sed -E 's#^postgres(ql)?://([^@]+@)?([^/:?]+).*$#\3#')"
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          [ -n "${IPV4:-}" ] && export PGHOSTADDR="$IPV4"
+          case "$CLEAN" in *sslmode=*) URI="$CLEAN";; *) URI="${CLEAN}?sslmode=require";; esac
+          F="db_${TS}.dump.gz"
+          pg_dump --dbname="$URI" --format=custom --no-owner --no-acl \
+            | gzip -c > "backups/$F"
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+
+      - id: manifest
+        run: |
+          set -euo pipefail
+          TS="${{ steps.prep.outputs.ts }}"
+          FILE="${{ steps.dump.outputs.file }}"
+          MIGRATION_HEAD="$(ls -1 db/migrations 2>/dev/null | tail -n 1 || true)"
+          cat > backups/manifest.json <<'JSON'
+          {
+            "timestamp_utc": "__TS__",
+            "app": {
+              "git_sha": "__SHA__",
+              "git_ref": "__REF__"
+            },
+            "db": {
+              "dump_file": "__FILE__",
+              "pg_dump_version": "__PGDUMP__",
+              "migration_head": "__MIG__"
+            },
+            "run": {
+              "github_run_id": "__RUN__",
+              "workflow": "Release DB Checkpoint"
+            }
+          }
+          JSON
+          PGDUMP_VER="$(pg_dump --version | sed 's/.* //')"
+          sed -i \
+            -e "s/__TS__/${TS}/" \
+            -e "s/__SHA__/${GIT_SHA}/" \
+            -e "s/__REF__/${GIT_REF}/" \
+            -e "s/__FILE__/${FILE}/" \
+            -e "s/__PGDUMP__/${PGDUMP_VER}/" \
+            -e "s/__MIG__/${MIGRATION_HEAD}/" \
+            -e "s/__RUN__/${RUN_ID}/" \
+            backups/manifest.json
+
+      - name: Push to backup repo (releases/<tag>/)
+        run: |
+          set -euo pipefail
+          TAG="${GIT_REF}"                     # nome da release/tag
+          DEST="https://github.com/${BACKUP_REPO}.git"
+          git clone --depth=1 "$DEST" out
+          cd out
+          mkdir -p "releases/${TAG}"
+          cp -v ../backups/* "releases/${TAG}/"
+
+          git config user.name  "Backup Bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add "releases/${TAG}"
+          git commit -m "checkpoint: ${TAG} (sha=${GIT_SHA:0:8})" || echo "No changes to commit"
+          git push origin HEAD
