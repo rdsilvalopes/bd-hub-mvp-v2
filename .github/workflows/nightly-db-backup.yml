@@ -1,0 +1,39 @@
+name: Nightly DB Backup
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC diário
+  workflow_dispatch: {}
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Instalar cliente PostgreSQL
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Preparar pasta
+        run: mkdir -p backups
+
+      - name: Dump (pg_dump custom + gzip)
+        env: { DB_URL: ${{ secrets.SUPABASE_DB_URL }} }
+        run: |
+          TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          F="db_${TS}.dump.gz"
+          pg_dump --no-owner --no-acl --format=custom "$DB_URL" | gzip -c > "backups/$F"
+          echo "FILENAME=$F" >> $GITHUB_ENV
+
+      - name: Clonar repo de backups
+        run: |
+          git clone "https://x-access-token:${{ secrets.BACKUP_PAT }}@github.com/${{ secrets.BACKUP_REPO }}" out
+
+      - name: Commit do backup
+        run: |
+          cp "backups/${{ env.FILENAME }}" out/
+          cd out
+          git config user.email "backup-bot@users.noreply.github.com"
+          git config user.name  "backup-bot"
+          git add "${{ env.FILENAME }}"
+          git commit -m "DB backup ${{ env.FILENAME }}" || echo "Nada a commitar"
+          git push
