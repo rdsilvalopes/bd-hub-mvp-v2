@@ -106,7 +106,7 @@ lnkForgot?.addEventListener("click", async (ev) => {
   try {
     await connectSupabase();
     const { error: e } = await sb.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/auth/reset.html`,
+      redirectTo: `${window.location.origin}/auth/index.html`,
     });
     if (e) return error(t(e.message));
     ok("Enviamos um link para redefinição. Abra o e-mail mais recente.");
@@ -143,4 +143,3 @@ lnkResend?.addEventListener("click", async (ev) => {
     if (ev.key === "Enter") btnIn?.click();
   })
 );
-
