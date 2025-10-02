@@ -1,0 +1,115 @@
+name: Nightly DB Backup
+
+on:
+  schedule:
+    - cron: "0 3 * * *"               # 03:00 UTC todo dia
+  workflow_dispatch:                  # permite rodar manualmente
+
+# evita dois backups rodando ao mesmo tempo
+concurrency:
+  group: nightly-db-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Secrets que já existem
+  BACKUP_REPO: ${{ secrets.BACKUP_REPO }}          # ex.: rdsilvalopes/bidly-backups
+  DB_URL:      ${{ secrets.SUPABASE_DB_URL }}      # URI do pooler + ?sslmode=require
+  GH_TOKEN:    ${{ secrets.BACKUP_PAT }}           # token com RW no repo de backups
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolver metadados de data/hora
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+          YEAR="$(date -u +%Y)"
+          MONTH="$(date -u +%m)"
+          DIR="nightly/${YEAR}/${MONTH}/${TS}"
+          echo "ts=$TS"   >> "$GITHUB_OUTPUT"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Preparar pasta local
+        run: mkdir -p backups
+
+      - name: Dump DB (pg_dump 17 via Docker; força IPv4 + SSL)
+        id: dump
+        env:
+          TS: ${{ steps.meta.outputs.ts }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1) Normaliza a URL e extrai host
+          CLEAN="$(printf '%s' "$DB_URL" | tr -d '[:space:]')"
+          HOST="$(printf '%s' "$CLEAN" | sed -E 's#^postgres(ql)?://([^@]+@)?([^/:?]+).*$#\3#')"
+
+          # 2) Resolve IPv4 (se possível) e anuncia
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          EXTRA=""
+          if [ -n "${IPV4:-}" ]; then
+            echo "Resolved $HOST -> $IPV4"
+            EXTRA="-e PGHOSTADDR=$IPV4"
+          else
+            echo "WARNING: não resolveu IPv4 (seguindo padrão do Docker resolv)"
+          fi
+
+          # 3) Garante sslmode=require na URI
+          case "$CLEAN" in *sslmode=*) URI="$CLEAN" ;; *) URI="${CLEAN}?sslmode=require" ;; esac
+
+          # 4) Executa pg_dump v17 (imagem oficial) e compacta
+          F="db_${TS}.dump.gz"
+          docker run --rm -i $EXTRA -e URI="$URI" postgres:17-alpine \
+            sh -lc 'pg_dump --dbname="$URI" --format=custom --no-owner --no-acl' \
+            | gzip -c > "backups/$F"
+
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+
+      - name: Escrever manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="${{ steps.meta.outputs.ts }}"
+          FILE="${{ steps.dump.outputs.file }}"
+          cat > backups/manifest.json <<JSON
+          {
+            "timestamp_utc": "${TS}",
+            "git_sha":       "${{ github.sha }}",
+            "git_ref":       "${{ github.ref_name }}",
+            "dump_file":     "${FILE}",
+            "pg_dump":       "17 (docker postgres:17-alpine)"
+          }
+          JSON
+          cat backups/manifest.json
+
+      - name: Enviar para repositório de backups
+        env:
+          DST: ${{ steps.meta.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # autentica push
+          git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git clone --depth=1 "https://github.com/${BACKUP_REPO}.git" out
+          cd out
+
+          mkdir -p "$DST"
+          cp -v ../backups/* "$DST/"
+
+          git config user.name  "Backup Bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add "$DST"
+          git commit -m "nightly: $DST" || echo "Nada a commitar"
+          git push origin HEAD
